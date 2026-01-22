@@ -38,6 +38,8 @@ BUCKET_NAME = os.environ.get('BUCKET_NAME')
 if not BUCKET_NAME:
     raise RuntimeError('Missing env var BUCKET_NAME')
 
+SYNC_HTTP_TIMEOUT_S = int(os.environ.get('SYNC_HTTP_TIMEOUT_S', '300'))
+
 fs = firestore.Client()
 gcs = storage.Client()
 bucket = gcs.bucket(BUCKET_NAME)
@@ -96,6 +98,10 @@ def gpx_object_path(user_id: str, activity_id: int) -> str:
 # -------------------------
 def get_garmin_api(email: str, password: str) -> Garmin:
     api = Garmin(email, password)
+    try:
+        api.garth.configure(timeout=SYNC_HTTP_TIMEOUT_S)
+    except Exception:
+        pass
     api.login()
     return api
 
