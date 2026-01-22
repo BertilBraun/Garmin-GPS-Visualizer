@@ -1,0 +1,556 @@
+<!-- web/index.html -->
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Windsurf Tracks</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body {
+            margin: 0;
+            display: grid;
+            grid-template-columns: 500px 1fr;
+            height: 100vh;
+            font-family: system-ui, sans-serif;
+        }
+
+        #sidebar {
+            padding: 12px;
+            border-right: 1px solid #ddd;
+            overflow: auto;
+        }
+
+        #map {
+            height: 100vh;
+        }
+
+        .row {
+            margin: 10px 0;
+        }
+
+        .item {
+            margin: 10px 0;
+            padding: 8px;
+            border: 1px solid #eee;
+            border-radius: 8px;
+        }
+
+        input,
+        button {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+        }
+
+        button {
+            padding: 10px;
+        }
+
+        small {
+            color: #666;
+        }
+
+        #status {
+            white-space: pre-wrap;
+            font-size: 12px;
+        }
+
+        .two {
+            display: flex;
+            gap: 8px;
+        }
+
+        .two>* {
+            flex: 1;
+        }
+
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+        }
+
+        .rangeRow {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .rangeRow input {
+            width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="sidebar">
+        <h2>Windsurf Tracks</h2>
+
+        <div class="row">
+            <label>View User ID (public)</label><br />
+            <input id="viewUserId" placeholder="e.g. myuserid" />
+            <small>Saved in your browser for convenience.</small>
+        </div>
+
+        <div class="row two">
+            <button id="loadView">Load</button>
+            <button id="clear">Clear</button>
+        </div>
+
+        <hr />
+
+        <h3>Sync (requires Garmin credentials)</h3>
+
+        <div class="row">
+            <label>Email</label><br />
+            <input id="email" type="email" placeholder="you@example.com" autocomplete="username" />
+            <small>Saved locally in your browser.</small>
+        </div>
+
+        <div class="row">
+            <label>Password</label><br />
+            <input id="password" type="password" placeholder="Garmin password" autocomplete="current-password" />
+            <small>Not stored. Only used for sync.</small>
+        </div>
+
+        <div class="row">
+            <label>Spot radius (meters)</label><br />
+            <input id="spotRadius" type="number" value="1200" min="50" step="50" />
+        </div>
+
+        <div class="row">
+            <button id="sync">Sync</button>
+        </div>
+
+        <div class="row">
+            <div id="status"></div>
+        </div>
+
+        <div class="row">
+            <div><b>Derived User ID</b>: <span id="derivedUserId" class="mono">—</span></div>
+            <small>Derived from email local-part, alphanumeric only.</small>
+        </div>
+
+        <hr />
+
+        <h3>Timeline filter (local)</h3>
+        <!-- Two-thumb slider via two overlapping range inputs -->
+        <div class="row">
+            <div class="rangeRow">
+                <input id="tStart" type="range" min="0" max="100" value="0" />
+                <input id="tEnd" type="range" min="0" max="100" value="100" />
+            </div>
+            <div class="mono" id="tLabel">—</div>
+            <small>Two handles on one line. Everything between them is shown.</small>
+        </div>
+
+        <hr />
+
+        <h3>Spots</h3>
+        <div class="row">
+            <button id="loadSpots">Load / Refresh spots</button>
+            <small>Computed on the fly by clustering per-activity mean points.</small>
+        </div>
+
+        <hr />
+
+        <div id="selection">Click a track to see details. Click on empty map to deselect.</div>
+        <div id="list"></div>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // ----------------------------
+        // Helpers
+        // ----------------------------
+        function userIdFromEmail(email) {
+            const local = (email || "").split("@")[0] || "";
+            return local.toLowerCase().replace(/[^a-z0-9]/g, "");
+        }
+
+        function setStatus(msg) {
+            document.getElementById("status").textContent = msg;
+        }
+
+        function saveLS(key, value) {
+            try { localStorage.setItem(key, value); } catch { }
+        }
+
+        function loadLS(key) {
+            try { return localStorage.getItem(key) || ""; } catch { return ""; }
+        }
+
+        function parseTime(s) {
+            const t = Date.parse(s || "");
+            return Number.isFinite(t) ? t : NaN;
+        }
+
+        function fmtTime(ms) {
+            if (!Number.isFinite(ms)) return "—";
+            return new Date(ms).toISOString().replace("T", " ").replace("Z", "Z");
+        }
+
+        // ----------------------------
+        // Map
+        // ----------------------------
+        const map = L.map("map").setView([28.0, -16.6], 11);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+
+        const tracksGroup = L.layerGroup().addTo(map);
+        const spotsGroup = L.layerGroup().addTo(map);
+
+        // Deselect on empty map click
+        map.on("click", () => {
+            document.getElementById("selection").textContent = "Click a track to see details. Click on empty map to deselect.";
+        });
+
+        // ----------------------------
+        // State (per viewed user)
+        // ----------------------------
+        let currentUserId = null;
+        let activities = [];
+        const activitiesById = new Map();
+
+        // Fetch-once caches
+        const geoCache = new Map();     // activityId -> feature
+        const inflight = new Map();     // activityId -> promise
+        const layerById = new Map();    // activityId -> leaflet layer
+
+        // timeline slider backing
+        let timelineTimes = [];         // sorted ms
+        let steps = 1;
+
+        function clearAll() {
+            tracksGroup.clearLayers();
+            spotsGroup.clearLayers();
+            activities = [];
+            activitiesById.clear();
+            currentUserId = null;
+
+            geoCache.clear();
+            inflight.clear();
+            layerById.clear();
+
+            document.getElementById("list").innerHTML = "";
+            document.getElementById("selection").textContent = "Click a track to see details. Click on empty map to deselect.";
+            document.getElementById("tLabel").textContent = "—";
+            setStatus("Cleared.");
+        }
+
+        async function loadActivities(userId) {
+            const r = await fetch(`/api/${userId}/activities`);
+            if (!r.ok) {
+                const err = await r.json().catch(() => ({}));
+                throw new Error(err.detail || "Failed to load activities");
+            }
+            activities = await r.json();
+            activitiesById.clear();
+            for (const a of activities) activitiesById.set(String(a.activityId), a);
+        }
+
+        async function getFeatureOnce(userId, activityId) {
+            const key = String(activityId);
+            if (geoCache.has(key)) return geoCache.get(key);
+            if (inflight.has(key)) return inflight.get(key);
+
+            const p = (async () => {
+                const r = await fetch(`/api/${userId}/activity/${activityId}/geojson`, { cache: "force-cache" });
+                if (!r.ok) {
+                    const err = await r.json().catch(() => ({}));
+                    throw new Error(err.detail || `Failed geojson for ${activityId}`);
+                }
+                const feature = await r.json();
+                geoCache.set(key, feature);
+                inflight.delete(key);
+                return feature;
+            })();
+
+            inflight.set(key, p);
+            return p;
+        }
+
+        function visibleActivitiesByTime(startMs, endMs) {
+            return activities.filter(a => {
+                const t = parseTime(a.startTime);
+                if (!Number.isFinite(t)) return true;
+                return t >= startMs && t <= endMs;
+            });
+        }
+
+        function renderActivityList(visible) {
+            const list = document.getElementById("list");
+            list.innerHTML = "";
+
+            const header = document.createElement("div");
+            header.className = "item";
+            header.innerHTML = `<b>Visible activities</b><div class="mono">${visible.length}</div>`;
+            list.appendChild(header);
+
+            for (const act of visible) {
+                const div = document.createElement("div");
+                div.className = "item";
+                div.innerHTML =
+                    `<b>${act.name || "Windsurfing"}</b>` +
+                    (act.startTime ? `<div class="mono">${act.startTime}</div>` : "") +
+                    `<div><a href="/api/${currentUserId}/activity/${act.activityId}/open" target="_blank">Open in Garmin</a></div>`;
+                list.appendChild(div);
+            }
+        }
+
+        async function renderVisibleSet(visible) {
+            if (!currentUserId) return;
+
+            const want = new Set(visible.map(a => String(a.activityId)));
+
+            // remove missing
+            for (const [aid, layer] of layerById.entries()) {
+                if (!want.has(aid)) {
+                    tracksGroup.removeLayer(layer);
+                    layerById.delete(aid);
+                }
+            }
+
+            // add new
+            for (const a of visible) {
+                const aid = String(a.activityId);
+                if (layerById.has(aid)) continue;
+
+                const feature = await getFeatureOnce(currentUserId, a.activityId);
+
+                const layer = L.geoJSON(feature, {
+                    style: () => ({ weight: 2, opacity: 0.55 }),
+                    onEachFeature: (f, l) => {
+                        l.on("click", (ev) => {
+                            // Prevent map click (deselect) from firing after polyline click
+                            if (ev?.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+
+                            document.getElementById("selection").innerHTML =
+                                `<b>Selected</b>
+                 <div class="mono">activityId: ${f.properties.activityId}</div>
+                 <div>${f.properties.name || "Windsurfing"}</div>
+                 <div class="mono">${f.properties.startTime || ""}</div>
+                 <div><a href="/api/${currentUserId}/activity/${f.properties.activityId}/open" target="_blank">Open in Garmin</a></div>`;
+                        });
+                    }
+                });
+
+                layer.addTo(tracksGroup);
+                layerById.set(aid, layer);
+            }
+
+            setStatus(
+                `Rendered ${visible.length}\n` +
+                `geoCache: ${geoCache.size}\n` +
+                `inflight: ${inflight.size}`
+            );
+        }
+
+        function computeTimeline() {
+            timelineTimes = activities
+                .map(a => parseTime(a.startTime))
+                .filter(t => Number.isFinite(t))
+                .sort((a, b) => a - b);
+
+            steps = Math.max(timelineTimes.length - 1, 1);
+
+            const tStart = document.getElementById("tStart");
+            const tEnd = document.getElementById("tEnd");
+
+            tStart.min = "0"; tStart.max = String(steps); tStart.value = "0";
+            tEnd.min = "0"; tEnd.max = String(steps); tEnd.value = String(steps);
+        }
+
+        function currentRange() {
+            const tStart = document.getElementById("tStart");
+            const tEnd = document.getElementById("tEnd");
+
+            let i0 = Number(tStart.value);
+            let i1 = Number(tEnd.value);
+            if (i0 > i1) [i0, i1] = [i1, i0];
+
+            if (!timelineTimes.length) {
+                const now = Date.now();
+                return [now - 86400 * 1000 * 30, now];
+            }
+            return [timelineTimes[i0], timelineTimes[i1]];
+        }
+
+        async function onTimelineChange() {
+            const [a, b] = currentRange();
+            document.getElementById("tLabel").textContent = `${fmtTime(a)}  →  ${fmtTime(b)}`;
+
+            const visible = visibleActivitiesByTime(a, b);
+            renderActivityList(visible);
+            await renderVisibleSet(visible);
+        }
+
+        async function loadSpots() {
+            if (!currentUserId) return;
+            const radius = Number(document.getElementById("spotRadius").value || 1200);
+
+            const r = await fetch(`/api/${currentUserId}/spots?radius_m=${encodeURIComponent(radius)}`);
+            if (!r.ok) {
+                const err = await r.json().catch(() => ({}));
+                throw new Error(err.detail || "Failed to load spots");
+            }
+            const spots = await r.json();
+
+            spotsGroup.clearLayers();
+
+            for (const s of spots) {
+                const m = L.circleMarker([s.lat, s.lon], { radius: 7, weight: 2, opacity: 0.9, fillOpacity: 0.4 });
+                m.addTo(spotsGroup);
+
+                m.on("click", async (ev) => {
+                    if (ev?.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+
+                    const rr = await fetch(`/api/${currentUserId}/spot/${s.id}/activities?radius_m=${encodeURIComponent(radius)}`);
+                    const acts = await rr.json();
+
+                    document.getElementById("selection").innerHTML =
+                        `<b>Spot ${s.id}</b>
+             <div class="mono">${acts.length} activities</div>`;
+
+                    // show list for this spot only
+                    const list = document.getElementById("list");
+                    list.innerHTML = "";
+                    for (const a of acts) {
+                        const div = document.createElement("div");
+                        div.className = "item";
+                        div.innerHTML =
+                            `<b>${a.name || "Windsurfing"}</b>` +
+                            (a.startTime ? `<div class="mono">${a.startTime}</div>` : "") +
+                            `<div><a href="/api/${currentUserId}/activity/${a.activityId}/open" target="_blank">Open in Garmin</a></div>`;
+                        list.appendChild(div);
+                    }
+                });
+            }
+        }
+
+        async function loadUser(userId) {
+            // reset rendered layers but keep fetch cache only if same user
+            tracksGroup.clearLayers();
+            spotsGroup.clearLayers();
+            layerById.clear();
+
+            if (currentUserId !== userId) {
+                geoCache.clear();
+                inflight.clear();
+            }
+
+            currentUserId = userId;
+
+            setStatus(`Loading activities for ${userId}...`);
+            await loadActivities(userId);
+            setStatus(`Loaded ${activities.length} activities.`);
+
+            computeTimeline();
+
+            // connect timeline handlers
+            const tStart = document.getElementById("tStart");
+            const tEnd = document.getElementById("tEnd");
+            tStart.oninput = () => onTimelineChange(); // no debounce, per your request
+            tEnd.oninput = () => onTimelineChange();
+
+            await onTimelineChange();
+            await loadSpots();
+        }
+
+        // ----------------------------
+        // Wiring
+        // ----------------------------
+        const viewUserId = document.getElementById("viewUserId");
+        const loadViewBtn = document.getElementById("loadView");
+        const clearBtn = document.getElementById("clear");
+        const loadSpotsBtn = document.getElementById("loadSpots");
+
+        const emailInput = document.getElementById("email");
+        const passwordInput = document.getElementById("password");
+        const spotRadiusInput = document.getElementById("spotRadius");
+        const derivedUserIdSpan = document.getElementById("derivedUserId");
+        const syncBtn = document.getElementById("sync");
+
+        // load persisted fields
+        emailInput.value = loadLS("garmin_email");
+        viewUserId.value = loadLS("view_userid");
+        derivedUserIdSpan.textContent = userIdFromEmail(emailInput.value) || "—";
+
+        emailInput.addEventListener("input", () => {
+            const email = emailInput.value.trim();
+            derivedUserIdSpan.textContent = userIdFromEmail(email) || "—";
+            if (email) saveLS("garmin_email", email);
+        });
+
+        viewUserId.addEventListener("input", () => {
+            const uid = viewUserId.value.trim();
+            if (uid) saveLS("view_userid", uid);
+        });
+
+        loadViewBtn.onclick = async () => {
+            const uid = (viewUserId.value || "").trim();
+            if (!uid) { setStatus("Enter a userId to view."); return; }
+            saveLS("view_userid", uid);
+            try { await loadUser(uid); }
+            catch (e) { setStatus(String(e)); }
+        };
+
+        clearBtn.onclick = () => clearAll();
+
+        loadSpotsBtn.onclick = async () => {
+            try { await loadSpots(); setStatus("Spots refreshed."); }
+            catch (e) { setStatus(String(e)); }
+        };
+
+        syncBtn.onclick = async () => {
+            const email = emailInput.value.trim();
+            const password = passwordInput.value;
+            const spotRadius = Number(spotRadiusInput.value || 1200);
+
+            if (!email || !password) {
+                setStatus("Enter email + password to sync.");
+                return;
+            }
+
+            const derived = userIdFromEmail(email);
+            derivedUserIdSpan.textContent = derived;
+
+            setStatus("Syncing (can take a while)...");
+            syncBtn.disabled = true;
+            syncBtn.text = 'Syncing'
+
+            try {
+                const resp = await fetch("/api/sync", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email, password, spot_radius_m: spotRadius })
+                });
+
+                const payload = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    const d = payload.detail;
+                    throw new Error(typeof d === "string" ? d : (d?.error || "Sync failed"));
+                }
+
+                // after sync: set view userId, persist, and load
+                viewUserId.value = payload.user_id;
+                saveLS("view_userid", payload.user_id);
+
+                setStatus(
+                    `Sync OK\nuser_id: ${payload.user_id}\nindexed: ${payload.indexed}\nnew GPX uploaded: ${payload.new_gpx_uploaded}\nlast_sync: ${payload.last_sync}`
+                );
+
+                await loadUser(payload.user_id);
+
+            } catch (e) {
+                setStatus(String(e));
+            } finally {
+                syncBtn.textContent = 'Sync'
+                syncBtn.disabled = false;
+            }
+        };
+    </script>
+</body>
+
+</html>

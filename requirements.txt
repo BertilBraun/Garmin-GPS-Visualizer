@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+gpxpy
+garminconnect
+google-cloud-firestore
+google-cloud-storage
