@@ -9,7 +9,7 @@
 
     <style>
         :root {
-            --leftW: 280px;
+            --leftW: 300px;
             --rightW: 380px;
         }
 
@@ -306,6 +306,18 @@
             const k = String(typeKey || "unknown").replace(/_/g, " ").trim();
             if (!k) return "Unknown";
             return k.split(/\s+/).map(w => w ? (w[0].toUpperCase() + w.slice(1)) : w).join(" ");
+        }
+
+        function updateUrlParams(updates) {
+            const p = new URLSearchParams(window.location.search);
+            if (updates.uid) p.set("uid", updates.uid);
+            if (updates.uid === "") p.delete("uid");
+            if (updates.type) p.set("type", updates.type);
+            if (updates.type === "") p.delete("type");
+
+            const qs = p.toString();
+            const url = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+            window.history.replaceState(null, "", url);
         }
 
         async function fetchActivityTypes(userId) {
@@ -761,6 +773,7 @@
 
             currentTypeKey = (typeKey || "").trim().toLowerCase() || null;
             saveLS(`type_${currentUserId}`, currentTypeKey || "");
+            updateUrlParams({ uid: currentUserId, type: currentTypeKey || "" });
 
             tracksGroup.clearLayers();
             layerById.clear();
@@ -811,7 +824,9 @@
             }
 
             const savedType = loadLS(`type_${userId}`).trim().toLowerCase();
-            const preferred = (types.find(t => String(t.typeKey).toLowerCase() === savedType)?.typeKey) || types[0].typeKey;
+            const preferredFromUrl = urlType && types.find(t => String(t.typeKey).toLowerCase() === urlType)?.typeKey;
+            const preferredFromSaved = types.find(t => String(t.typeKey).toLowerCase() === savedType)?.typeKey;
+            const preferred = preferredFromUrl || preferredFromSaved || types[0].typeKey;
 
             for (const t of types) {
                 const opt = document.createElement("option");
@@ -845,7 +860,9 @@
         viewUserId.value = loadLS("view_userid");
         derivedUserIdSpan.textContent = userIdFromEmail(emailInput.value) || "—";
 
-        const urlUid = new URLSearchParams(window.location.search).get("uid");
+        const params = new URLSearchParams(window.location.search);
+        const urlUid = params.get("uid");
+        const urlType = (params.get("type") || "").trim().toLowerCase();
         if (urlUid && urlUid.trim()) {
             const uid = urlUid.trim();
             viewUserId.value = uid;
@@ -919,6 +936,7 @@
             const uid = (viewUserId.value || "").trim();
             if (!uid) { setStatus("Enter a userId to view."); return; }
             saveLS("view_userid", uid);
+            updateUrlParams({ uid, type: currentTypeKey || "" });
             try { await loadUser(uid); }
             catch (e) { setStatus(String(e)); }
         };
