@@ -7,6 +7,9 @@ import re
 import time
 import math
 import traceback
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +42,7 @@ if not BUCKET_NAME:
     raise RuntimeError('Missing env var BUCKET_NAME')
 
 SYNC_HTTP_TIMEOUT_S = int(os.environ.get('SYNC_HTTP_TIMEOUT_S', '300'))
+SYNC_GPX_PARALLELISM = int(os.environ.get('SYNC_GPX_PARALLELISM', '10'))
 
 fs = firestore.Client()
 gcs = storage.Client()
@@ -123,6 +127,40 @@ def list_activities(api: Garmin) -> List[Dict[str, Any]]:
 
 def download_gpx(api: Garmin, activity_id: int) -> bytes:
     return api.download_activity(str(activity_id), dl_fmt=Garmin.ActivityDownloadFormat.GPX)
+
+
+_garmin_threadlocal = threading.local()
+
+
+def _thread_garmin_api(tokenstore: str) -> Garmin:
+    api = getattr(_garmin_threadlocal, 'api', None)
+    if api is not None and getattr(_garmin_threadlocal, 'tokenstore', None) == tokenstore:
+        return api
+
+    api = Garmin()
+    api.garth.loads(tokenstore)
+    try:
+        api.garth.configure(timeout=SYNC_HTTP_TIMEOUT_S)
+    except Exception:
+        pass
+
+    _garmin_threadlocal.api = api
+    _garmin_threadlocal.tokenstore = tokenstore
+    return api
+
+
+def _download_gpx_and_mean(tokenstore: str, activity_id: int) -> Tuple[int, bytes, Optional[Tuple[float, float]]]:
+    api = _thread_garmin_api(tokenstore)
+    for attempt in range(4):
+        try:
+            data = download_gpx(api, activity_id)
+            pts = parse_gpx_points_from_bytes(data)
+            mp = mean_point(pts)
+            return activity_id, data, mp
+        except GarminConnectTooManyRequestsError:
+            if attempt >= 3:
+                raise
+            time.sleep(10 * (attempt + 1) + random.random() * 2)
 
 
 # -------------------------
@@ -246,21 +284,40 @@ def sync_activities(email: str, password: str, spot_radius_m: float) -> SyncResp
     col = activities_collection(user_id)
 
     api = get_garmin_api(email, password)
+    tokenstore = api.garth.dumps()
     acts = list_activities(api)
 
+    existing_docs = {int(d.id): (d.to_dict() or {}) for d in col.stream()}
+
+    download_ids: List[int] = []
+    for a in acts:
+        aid = get_activity_id(a)
+        if aid is None:
+            continue
+        if aid in existing_docs:
+            continue
+        if activity_has_polyline(a):
+            download_ids.append(aid)
+
+    downloads: Dict[int, Tuple[bytes, Optional[Tuple[float, float]]]] = {}
+    if download_ids:
+        with ThreadPoolExecutor(max_workers=max(1, SYNC_GPX_PARALLELISM)) as ex:
+            futs = {ex.submit(_download_gpx_and_mean, tokenstore, aid): aid for aid in download_ids}
+            for fut in as_completed(futs):
+                aid, data, mp = fut.result()
+                downloads[aid] = (data, mp)
+
     new_uploaded = 0
+    created_docs = 0
 
     for a in sorted(acts, key=lambda x: int(get_activity_id(x) or 0)):
         aid = get_activity_id(a)
         if aid is None:
             continue
 
-        print(f'Processing activity: {aid}')
-
         doc_ref = col.document(str(aid))
-        snap = doc_ref.get()
-        if snap.exists:
-            existing = snap.to_dict() or {}
+        if aid in existing_docs:
+            existing = existing_docs[aid]
             updates: Dict[str, Any] = {}
             if not existing.get('typeKey'):
                 updates['typeKey'] = activity_type_key(a, email)
@@ -277,17 +334,13 @@ def sync_activities(email: str, password: str, spot_radius_m: float) -> SyncResp
         blob_name = None
         mp = None
         if activity_has_polyline(a):
-            try:
-                data = download_gpx(api, aid)
-            except GarminConnectTooManyRequestsError:
-                time.sleep(30)
-                data = download_gpx(api, aid)
-
-            pts = parse_gpx_points_from_bytes(data)
-            mp = mean_point(pts)
-
-            blob = bucket.blob(gpx_object_path(user_id, aid))
-            blob.upload_from_string(data, content_type='application/gpx+xml')
+            got = downloads.get(aid)
+            if got is not None:
+                data, mp = got
+                blob = bucket.blob(gpx_object_path(user_id, aid))
+                blob.upload_from_string(data, content_type='application/gpx+xml')
+                blob_name = blob.name
+                new_uploaded += 1
 
         meta = {
             'activityId': aid,
@@ -301,13 +354,12 @@ def sync_activities(email: str, password: str, spot_radius_m: float) -> SyncResp
             'createdAt': firestore.SERVER_TIMESTAMP,
         }
         doc_ref.set(meta)
-
-        time.sleep(0.3)
+        created_docs += 1
 
     last_sync = datetime.utcnow().isoformat() + 'Z'
     fs.collection('users').document(user_id).set({'lastSync': last_sync}, merge=True)
 
-    indexed = len(list(col.stream()))
+    indexed = len(existing_docs) + created_docs
 
     return SyncResponse(user_id=user_id, indexed=indexed, new_gpx_uploaded=new_uploaded, last_sync=last_sync)
 
