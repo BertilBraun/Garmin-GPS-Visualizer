@@ -128,11 +128,26 @@ def download_gpx(api: Garmin, activity_id: int) -> bytes:
 # -------------------------
 # Activity parsing helpers
 # -------------------------
-def is_windsurf(activity: Dict[str, Any]) -> bool:
+
+
+def activity_type_key(activity: Dict[str, Any], email: str) -> str:
     t = activity.get('activityType') or {}
-    type_key = (t.get('typeKey') or t.get('typeName') or activity.get('activityTypeName') or '').lower()
-    name = (activity.get('activityName') or activity.get('activityTitle') or '').lower()
-    return ('windsurf' in type_key) or ('windsurf' in name)
+    type_key = (t.get('typeKey') or t.get('typeName') or activity.get('activityTypeName') or '').strip().lower()
+
+    if type_key == 'other' and email == 'bertil.braun.private@gmail.com':
+        return 'windsurfing_v2'
+    return re.sub(r'[^a-z0-9_]+', '', type_key) or 'unknown'
+
+
+def activity_display_name(activity: Dict[str, Any]) -> str:
+    return str(
+        activity.get('activityName') or activity.get('activityTitle') or activity.get('activityTypeName') or 'Activity'
+    )
+
+
+def activity_has_polyline(activity: Dict[str, Any]) -> bool:
+    v = activity.get('hasPolyline')
+    return bool(v) if v is not None else False
 
 
 def get_activity_id(activity: Dict[str, Any]) -> Optional[int]:
@@ -226,54 +241,67 @@ def to_linestring_geojson(points: List[Tuple[float, float]]) -> Dict[str, Any]:
 # -------------------------
 # Sync pipeline
 # -------------------------
-def sync_windsurf(email: str, password: str, spot_radius_m: float) -> SyncResponse:
+def sync_activities(email: str, password: str, spot_radius_m: float) -> SyncResponse:
     user_id = user_id_from_email(email)
     col = activities_collection(user_id)
 
     api = get_garmin_api(email, password)
     acts = list_activities(api)
 
-    windsurf: List[Tuple[int, Dict[str, Any]]] = []
-    for a in acts:
-        if not is_windsurf(a):
-            continue
+    new_uploaded = 0
+
+    for a in sorted(acts, key=lambda x: int(get_activity_id(x) or 0)):
         aid = get_activity_id(a)
         if aid is None:
             continue
-        windsurf.append((aid, a))
 
-    new_uploaded = 0
+        print(f'Processing activity: {aid}')
 
-    for aid, a in sorted(windsurf, key=lambda x: x[0]):
         doc_ref = col.document(str(aid))
-        if doc_ref.get().exists:
+        snap = doc_ref.get()
+        if snap.exists:
+            existing = snap.to_dict() or {}
+            updates: Dict[str, Any] = {}
+            if not existing.get('typeKey'):
+                updates['typeKey'] = activity_type_key(a, email)
+            if not existing.get('name'):
+                updates['name'] = activity_display_name(a)
+            if not existing.get('startTime'):
+                updates['startTime'] = parse_start_time(a)
+            if not existing.get('connectUrl'):
+                updates['connectUrl'] = connect_url(aid)
+            if updates:
+                doc_ref.set(updates, merge=True)
             continue
 
-        try:
-            data = download_gpx(api, aid)
-        except GarminConnectTooManyRequestsError:
-            time.sleep(30)
-            data = download_gpx(api, aid)
+        blob_name = None
+        mp = None
+        if activity_has_polyline(a):
+            try:
+                data = download_gpx(api, aid)
+            except GarminConnectTooManyRequestsError:
+                time.sleep(30)
+                data = download_gpx(api, aid)
 
-        pts = parse_gpx_points_from_bytes(data)
-        mp = mean_point(pts)
+            pts = parse_gpx_points_from_bytes(data)
+            mp = mean_point(pts)
 
-        blob = bucket.blob(gpx_object_path(user_id, aid))
-        blob.upload_from_string(data, content_type='application/gpx+xml')
+            blob = bucket.blob(gpx_object_path(user_id, aid))
+            blob.upload_from_string(data, content_type='application/gpx+xml')
 
         meta = {
             'activityId': aid,
-            'name': a.get('activityName') or a.get('activityTitle') or 'Windsurfing',
+            'name': activity_display_name(a),
             'startTime': parse_start_time(a),
+            'typeKey': activity_type_key(a, email),
             'connectUrl': connect_url(aid),
-            'gpxObject': blob.name,
+            'gpxObject': blob_name,
             'meanLat': mp[0] if mp else None,
             'meanLon': mp[1] if mp else None,
             'createdAt': firestore.SERVER_TIMESTAMP,
         }
         doc_ref.set(meta)
 
-        new_uploaded += 1
         time.sleep(0.3)
 
     last_sync = datetime.utcnow().isoformat() + 'Z'
@@ -290,7 +318,7 @@ def sync_windsurf(email: str, password: str, spot_radius_m: float) -> SyncRespon
 @APP.post('/api/sync', response_model=SyncResponse)
 def api_sync(body: SyncRequest):
     try:
-        return sync_windsurf(body.email, body.password, body.spot_radius_m)
+        return sync_activities(body.email, body.password, body.spot_radius_m)
 
     except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
         raise HTTPException(status_code=401, detail=f'Garmin login failed: {e}')
@@ -304,20 +332,42 @@ def api_sync(body: SyncRequest):
         raise HTTPException(status_code=500, detail={'error': str(e), 'traceback': tb})
 
 
-@APP.get('/api/{user_id}/activities')
-def list_user_activities(user_id: str):
+@APP.get('/api/{user_id}/types')
+def list_user_activity_types(user_id: str):
     col = activities_collection(user_id)
     docs = list(col.stream())
     if not docs:
         raise HTTPException(status_code=404, detail='No activities for this user_id (sync first).')
 
+    counts: Dict[str, int] = {}
+    for d in docs:
+        x = d.to_dict() or {}
+        k = str(x.get('typeKey') or 'unknown').strip().lower() or 'unknown'
+        counts[k] = counts.get(k, 0) + 1
+
+    items = [{'typeKey': k, 'count': v} for (k, v) in counts.items()]
+    items.sort(key=lambda m: (-int(m['count']), str(m['typeKey'])))
+    return JSONResponse(items)
+
+
+@APP.get('/api/{user_id}/activities')
+def list_user_activities(user_id: str, type: Optional[str] = None):
+    col = activities_collection(user_id)
+    docs = list(col.stream())
+    if not docs:
+        raise HTTPException(status_code=404, detail='No activities for this user_id (sync first).')
+
+    type_key = (type or '').strip().lower()
     items: List[Dict[str, Any]] = []
     for d in docs:
         x = d.to_dict() or {}
+        if type_key and str(x.get('typeKey') or '').strip().lower() != type_key:
+            continue
         items.append(
             {
                 'activityId': int(x['activityId']),
-                'name': x.get('name') or 'Windsurfing',
+                'name': x.get('name') or 'Activity',
+                'typeKey': x.get('typeKey') or 'unknown',
                 'startTime': x.get('startTime'),
                 'connectUrl': x.get('connectUrl') or connect_url(int(x['activityId'])),
                 'meanLat': x.get('meanLat'),
@@ -330,7 +380,7 @@ def list_user_activities(user_id: str):
 
 
 @APP.get('/api/{user_id}/spots')
-def spots(user_id: str, radius_m: float = 1200.0):
+def spots(user_id: str, radius_m: float = 1200.0, type: Optional[str] = None):
     """
     Spots are computed on the fly from per-activity mean points and clustered by radius.
     """
@@ -339,9 +389,12 @@ def spots(user_id: str, radius_m: float = 1200.0):
     if not docs:
         raise HTTPException(status_code=404, detail='No activities for this user_id (sync first).')
 
+    type_key = (type or '').strip().lower()
     pts: List[Tuple[int, Tuple[float, float]]] = []
     for d in docs:
         x = d.to_dict() or {}
+        if type_key and str(x.get('typeKey') or '').strip().lower() != type_key:
+            continue
         if x.get('meanLat') is None or x.get('meanLon') is None:
             continue
         pts.append((int(x['activityId']), (float(x['meanLat']), float(x['meanLon']))))
@@ -351,7 +404,7 @@ def spots(user_id: str, radius_m: float = 1200.0):
 
 
 @APP.get('/api/{user_id}/spot/{spot_id}/activities')
-def spot_activities(user_id: str, spot_id: int, radius_m: float = 1200.0):
+def spot_activities(user_id: str, spot_id: int, radius_m: float = 1200.0, type: Optional[str] = None):
     # recompute spots and return activities for the selected one
     col = activities_collection(user_id)
     docs = list(col.stream())
@@ -361,13 +414,17 @@ def spot_activities(user_id: str, spot_id: int, radius_m: float = 1200.0):
     items: List[Dict[str, Any]] = []
     pts: List[Tuple[int, Tuple[float, float]]] = []
     by_id: Dict[int, Dict[str, Any]] = {}
+    type_key = (type or '').strip().lower()
 
     for d in docs:
         x = d.to_dict() or {}
+        if type_key and str(x.get('typeKey') or '').strip().lower() != type_key:
+            continue
         aid = int(x['activityId'])
         by_id[aid] = {
             'activityId': aid,
-            'name': x.get('name') or 'Windsurfing',
+            'name': x.get('name') or 'Activity',
+            'typeKey': x.get('typeKey') or 'unknown',
             'startTime': x.get('startTime'),
             'connectUrl': x.get('connectUrl') or connect_url(aid),
         }
@@ -394,7 +451,7 @@ def activity_geojson(user_id: str, activity_id: int):
     meta = doc.to_dict() or {}
     obj = meta.get('gpxObject')
     if not obj:
-        raise HTTPException(status_code=500, detail='Missing gpxObject in metadata.')
+        raise HTTPException(status_code=404, detail='No GPS track available for this activity.')
 
     blob = bucket.blob(obj)
     if not blob.exists():

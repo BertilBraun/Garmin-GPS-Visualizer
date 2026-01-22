@@ -4,7 +4,7 @@
 
 <head>
     <meta charset="utf-8" />
-    <title>Windsurf Tracks</title>
+    <title>Garmin GPS Visualizer</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 
     <style>
@@ -81,6 +81,12 @@
 
         input:not([type="range"]) {
             padding: 8px;
+        }
+
+        select {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
         }
 
         button {
@@ -202,7 +208,7 @@
 <body>
     <!-- LEFT SIDEBAR -->
     <div id="left">
-        <h2>Windsurf Tracks</h2>
+        <h2>Garmin GPS Visualizer</h2>
 
         <div class="row">
             <label>View User ID (public)</label><br />
@@ -211,6 +217,11 @@
 
         <div class="row two">
             <button id="loadView">Load</button>
+        </div>
+
+        <div class="row">
+            <label>Activity type</label><br />
+            <select id="activityType" disabled></select>
         </div>
 
         <hr />
@@ -291,6 +302,21 @@
             if (!Number.isFinite(ms)) return "—";
             return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
         }
+        function fmtTypeLabel(typeKey) {
+            const k = String(typeKey || "unknown").replace(/_/g, " ").trim();
+            if (!k) return "Unknown";
+            return k.split(/\s+/).map(w => w ? (w[0].toUpperCase() + w.slice(1)) : w).join(" ");
+        }
+
+        async function fetchActivityTypes(userId) {
+            const r = await fetch(`/api/${userId}/types`);
+            if (!r.ok) {
+                const err = await r.json().catch(() => ({}));
+                throw new Error(err.detail || "Failed to load activity types");
+            }
+            const items = await r.json();
+            return Array.isArray(items) ? items : [];
+        }
 
         function showRight(html) {
             document.body.classList.add("has-selection");
@@ -333,6 +359,7 @@
         // State
         // ----------------------------
         let currentUserId = null;
+        let currentTypeKey = null;
         let activities = [];       // all metadata
         let timelineTimes = [];    // sorted ms
 
@@ -373,8 +400,11 @@
             setStatus("Cleared.");
         }
 
-        async function loadActivities(userId) {
-            const r = await fetch(`/api/${userId}/activities`);
+        async function loadActivities(userId, typeKey) {
+            const q = new URLSearchParams();
+            if (typeKey) q.set("type", typeKey);
+            const suffix = q.toString() ? `?${q.toString()}` : "";
+            const r = await fetch(`/api/${userId}/activities${suffix}`);
             if (!r.ok) {
                 const err = await r.json().catch(() => ({}));
                 throw new Error(err.detail || "Failed to load activities");
@@ -475,6 +505,7 @@
 
         function visibleActivitiesByTime(startMs, endMs) {
             return activities.filter(a => {
+                if (a.meanLat == null || a.meanLon == null) return false;
                 const t = parseTime(a.startTime);
                 if (!Number.isFinite(t)) return true;
                 return t >= startMs && t <= endMs;
@@ -561,7 +592,7 @@
 
         function showActivitySelection(activityId, props) {
             const meta = activities.find(a => Number(a.activityId) === Number(activityId));
-            const name = props?.name || meta?.name || "Windsurfing";
+            const name = props?.name || meta?.name || "Activity";
             const startTime = props?.startTime || meta?.startTime || "";
             showRight(`
         <div class="item">
@@ -579,11 +610,13 @@
         // ----------------------------
         // Spots rendering + selection (timeline-aware)
         // ----------------------------
-        async function loadSpots() {
+        async function loadSpots(typeKey) {
             if (!currentUserId) return;
             const radius = Number(document.getElementById("spotRadius").value || 1200);
 
-            const r = await fetch(`/api/${currentUserId}/spots?radius_m=${encodeURIComponent(radius)}`);
+            const q = new URLSearchParams({ radius_m: String(radius) });
+            if (typeKey) q.set("type", typeKey);
+            const r = await fetch(`/api/${currentUserId}/spots?${q.toString()}`);
             if (!r.ok) {
                 const err = await r.json().catch(() => ({}));
                 throw new Error(err.detail || "Failed to load spots");
@@ -605,17 +638,19 @@
             }
         }
 
-        function spotActsCacheKey(spotId, radius) {
-            return `${spotId}:${radius}`;
+        function spotActsCacheKey(spotId, radius, typeKey) {
+            return `${typeKey || ""}:${spotId}:${radius}`;
         }
 
-        async function getSpotActivities(spotId, radius) {
-            const key = spotActsCacheKey(spotId, radius);
+        async function getSpotActivities(spotId, radius, typeKey) {
+            const key = spotActsCacheKey(spotId, radius, typeKey);
             if (spotActivitiesCache.has(key)) return spotActivitiesCache.get(key);
             if (spotActivitiesInflight.has(key)) return spotActivitiesInflight.get(key);
 
             const p = (async () => {
-                const rr = await fetch(`/api/${currentUserId}/spot/${spotId}/activities?radius_m=${encodeURIComponent(radius)}`);
+                const q = new URLSearchParams({ radius_m: String(radius) });
+                if (typeKey) q.set("type", typeKey);
+                const rr = await fetch(`/api/${currentUserId}/spot/${spotId}/activities?${q.toString()}`);
                 if (!rr.ok) {
                     const err = await rr.json().catch(() => ({}));
                     throw new Error(err.detail || "Failed to load spot activities");
@@ -635,7 +670,7 @@
             const radius = Number(document.getElementById("spotRadius").value || 1200);
             const [sMs, eMs] = (startMs === null || endMs === null) ? currentRangeMs() : [startMs, endMs];
 
-            const acts = await getSpotActivities(spot.id, radius);
+            const acts = await getSpotActivities(spot.id, radius, currentTypeKey);
 
             // Apply timeline filter client-side to the spot activities list
             const filtered = acts.filter(a => {
@@ -721,6 +756,34 @@
             await runTimelineUpdate(seq, a, b);
         }
 
+        async function loadType(typeKey) {
+            if (!currentUserId) return;
+
+            currentTypeKey = (typeKey || "").trim().toLowerCase() || null;
+            saveLS(`type_${currentUserId}`, currentTypeKey || "");
+
+            tracksGroup.clearLayers();
+            layerById.clear();
+            spotsGroup.clearLayers();
+            spotActivitiesCache.clear();
+            spotActivitiesInflight.clear();
+            hideRight();
+
+            setStatus(`Loading ${fmtTypeLabel(currentTypeKey)} activities for ${currentUserId}...`);
+            await loadActivities(currentUserId, currentTypeKey);
+            setStatus(`Loaded ${activities.length} activities.`);
+
+            computeTimeline();
+
+            const tStart = document.getElementById("tStart");
+            const tEnd = document.getElementById("tEnd");
+            tStart.oninput = () => scheduleTimelineUpdate();
+            tEnd.oninput = () => scheduleTimelineUpdate();
+
+            await loadSpots(currentTypeKey);
+            await updateTimelineNow();
+        }
+
         async function loadUser(userId) {
             tracksGroup.clearLayers();
             spotsGroup.clearLayers();
@@ -736,20 +799,31 @@
 
             currentUserId = userId;
 
-            setStatus(`Loading activities for ${userId}...`);
-            await loadActivities(userId);
-            setStatus(`Loaded ${activities.length} activities.`);
+            typeSelect.disabled = true;
+            typeSelect.innerHTML = "";
+            currentTypeKey = null;
 
-            computeTimeline();
+            setStatus(`Loading activity types for ${userId}...`);
+            const types = await fetchActivityTypes(userId);
+            if (!types.length) {
+                setStatus("No activity types found. Sync first.");
+                return;
+            }
 
-            const tStart = document.getElementById("tStart");
-            const tEnd = document.getElementById("tEnd");
+            const savedType = loadLS(`type_${userId}`).trim().toLowerCase();
+            const preferred = (types.find(t => String(t.typeKey).toLowerCase() === savedType)?.typeKey) || types[0].typeKey;
 
-            tStart.oninput = () => scheduleTimelineUpdate();
-            tEnd.oninput = () => scheduleTimelineUpdate();
+            for (const t of types) {
+                const opt = document.createElement("option");
+                opt.value = t.typeKey;
+                opt.textContent = `${fmtTypeLabel(t.typeKey)} (${t.count})`;
+                typeSelect.appendChild(opt);
+            }
 
-            await loadSpots();
-            await updateTimelineNow();
+            typeSelect.value = preferred;
+            typeSelect.disabled = false;
+
+            await loadType(preferred);
         }
 
         // ----------------------------
@@ -757,6 +831,7 @@
         // ----------------------------
         const viewUserId = document.getElementById("viewUserId");
         const loadViewBtn = document.getElementById("loadView");
+        const typeSelect = document.getElementById("activityType");
         const closeRightBtn = document.getElementById("closeRight");
         const rightContent = document.getElementById("rightContent");
 
@@ -792,6 +867,11 @@
         });
 
         closeRightBtn.onclick = () => hideRight();
+
+        typeSelect.addEventListener("change", () => {
+            if (!currentUserId) return;
+            loadType(typeSelect.value).catch(e => setStatus(String(e)));
+        });
 
         rightContent.addEventListener("click", async (ev) => {
             const target = ev.target;
@@ -849,7 +929,7 @@
             try {
                 spotActivitiesCache.clear();
                 spotActivitiesInflight.clear();
-                await loadSpots();
+                await loadSpots(currentTypeKey);
                 if (selectedSpot) {
                     // selectedSpot id may shift after reclustering; safest: close selection
                     hideRight();
@@ -874,7 +954,7 @@
             derivedUserIdSpan.textContent = derived;
 
             const prevSyncText = syncBtn.textContent;
-            syncBtn.textContent = "Syncing";
+            syncBtn.textContent = "Syncing (might take a couple of minutes)...";
             setStatus("Syncing (might take a couple of minutes)...");
             syncBtn.disabled = true;
 
