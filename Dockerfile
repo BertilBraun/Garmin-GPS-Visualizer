@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./app.py
+COPY geo_utils.py ./geo_utils.py
 COPY web ./web
 
 ENV PORT=8080
