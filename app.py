@@ -5,10 +5,10 @@ import logging
 import os
 import re
 import time
-import math
 import traceback
 import random
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,6 +28,8 @@ from garminconnect import (
 
 from google.cloud import firestore
 from google.cloud import storage
+
+from geo_utils import drop_spike_points, haversine_m
 
 APP = FastAPI()
 
@@ -155,12 +157,14 @@ def _download_gpx_and_mean(tokenstore: str, activity_id: int) -> Tuple[int, byte
         try:
             data = download_gpx(api, activity_id)
             pts = parse_gpx_points_from_bytes(data)
+            pts = drop_spike_points(pts)
             mp = mean_point(pts)
             return activity_id, data, mp
         except GarminConnectTooManyRequestsError:
             if attempt >= 3:
                 raise
             time.sleep(10 * (attempt + 1) + random.random() * 2)
+    assert False, 'Unreachable'
 
 
 # -------------------------
@@ -231,18 +235,6 @@ def mean_point(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float
         s_lon += lon
         n += 1
     return (s_lat / n, s_lon / n)
-
-
-def haversine_m(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    lat1, lon1 = a
-    lat2, lon2 = b
-    R = 6371000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    h = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
-    return 2 * R * math.asin(min(1.0, math.sqrt(h)))
 
 
 def cluster_spots(points: List[Tuple[int, Tuple[float, float]]], radius_m: float) -> List[Dict[str, Any]]:
@@ -495,7 +487,7 @@ def spot_activities(user_id: str, spot_id: int, radius_m: float = 1200.0, type: 
 
 
 @APP.get('/api/{user_id}/activity/{activity_id}/geojson')
-def activity_geojson(user_id: str, activity_id: int):
+def activity_geojson(user_id: str, activity_id: int, spike_filter: bool = True):
     doc = activities_collection(user_id).document(str(activity_id)).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail='Activity not found for this user_id.')
@@ -511,6 +503,8 @@ def activity_geojson(user_id: str, activity_id: int):
 
     data = blob.download_as_bytes()
     pts = parse_gpx_points_from_bytes(data)
+    if spike_filter:
+        pts = drop_spike_points(pts)
 
     feature = {
         'type': 'Feature',
@@ -525,7 +519,8 @@ def activity_geojson(user_id: str, activity_id: int):
 
     resp = JSONResponse(feature)
     resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
-    resp.headers['ETag'] = f'"{user_id}:{activity_id}"'
+    h = hashlib.sha1(data).hexdigest()[:16]
+    resp.headers['ETag'] = f'"{user_id}:{activity_id}:sf{int(bool(spike_filter))}:v2:{h}"'
     return resp
 
 

@@ -430,7 +430,7 @@
             if (inflight.has(key)) return inflight.get(key);
 
             const p = (async () => {
-                const r = await fetch(`/api/${userId}/activity/${activityId}/geojson`, { cache: "force-cache" });
+                const r = await fetch(`/api/${userId}/activity/${activityId}/geojson?v=2&spike_filter=1`, { cache: "force-cache" });
                 if (!r.ok) {
                     const err = await r.json().catch(() => ({}));
                     throw new Error(err.detail || `Failed geojson for ${activityId}`);
