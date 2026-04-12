@@ -15,3 +15,6 @@ Live demo: https://garmin-gps-visualizer-409522883519.europe-west1.run.app/
    - You can also deep-link directly: `/?uid=MYUSERID`
 5. Use the **Timeline filter** to limit what’s rendered on the map.
 6. Click a spot marker to list activities for that spot; click an activity in the right panel (or a track on the map) to highlight it.
+
+
+![Example](documentation/GPS-Visualizer%201.jpeg)
